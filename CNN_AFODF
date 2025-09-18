@@ -1,0 +1,214 @@
+import tensorflow as tf
+from keras.utils import plot_model
+from tensorflow.keras import layers, models, Input
+from tensorflow.keras.utils import to_categorical
+import numpy as np
+import os
+from Sub_Functions.Evaluate import main_est_parameters
+
+# =====================================================
+# Structural Attention Layer
+# =====================================================
+class StructuralAttention(layers.Layer):
+    def __init__(self, num_heads, embed_dim, mlp_dim):
+        super(StructuralAttention, self).__init__()
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.mlp_dim = mlp_dim
+
+        self.layer_norm = layers.LayerNormalization(epsilon=1e-6)
+        self.multi_head_attention = layers.MultiHeadAttention(
+            num_heads=self.num_heads, key_dim=self.embed_dim
+        )
+        self.dense_1 = layers.Dense(self.mlp_dim, activation='relu')
+        self.dense_2 = layers.Dense(self.embed_dim)
+
+    def call(self, inputs, scope=None, training=False):
+        x = self.layer_norm(inputs)
+        attention_output = self.multi_head_attention(query=x, value=x, key=x)
+        attention_output = attention_output + inputs
+        x = self.layer_norm(attention_output)
+        mlp_output = self.dense_1(x)
+        mlp_output = self.dense_2(mlp_output)
+        return mlp_output + attention_output
+
+    def get_config(self):
+        config = super(StructuralAttention, self).get_config()
+        config.update({
+            'num_heads': self.num_heads,
+            'embed_dim': self.embed_dim,
+            'mlp_dim': self.mlp_dim
+        })
+        return config
+
+# =====================================================
+# CBAM Block
+# =====================================================
+def cbam_block(input_feature, ratio=8):
+    channel = input_feature.shape[-1]
+    shared_layer_one = layers.Dense(channel // ratio, activation='relu',
+                                    kernel_initializer='he_normal', use_bias=True,
+                                    bias_initializer='zeros')
+    shared_layer_two = layers.Dense(channel, kernel_initializer='he_normal',
+                                    use_bias=True, bias_initializer='zeros')
+
+    # Channel Attention
+    avg_pool = layers.GlobalAveragePooling2D()(input_feature)
+    avg_pool = layers.Reshape((1, 1, channel))(avg_pool)
+    avg_pool = shared_layer_one(avg_pool)
+    avg_pool = shared_layer_two(avg_pool)
+
+    max_pool = layers.GlobalMaxPooling2D()(input_feature)
+    max_pool = layers.Reshape((1, 1, channel))(max_pool)
+    max_pool = shared_layer_one(max_pool)
+    max_pool = shared_layer_two(max_pool)
+
+    cbam_feature = layers.Add()([avg_pool, max_pool])
+    cbam_feature = layers.Activation('sigmoid')(cbam_feature)
+    channel_refined_feature = layers.Multiply()([input_feature, cbam_feature])
+
+    # Spatial Attention
+    avg_pool = tf.reduce_mean(channel_refined_feature, axis=-1, keepdims=True)
+    max_pool = tf.reduce_max(channel_refined_feature, axis=-1, keepdims=True)
+    concat = layers.Concatenate(axis=-1)([avg_pool, max_pool])
+    spatial_attention = layers.Conv2D(filters=1, kernel_size=7, strides=1,
+                                      padding='same', activation='sigmoid',
+                                      kernel_initializer='he_normal', use_bias=False)(concat)
+    return layers.Multiply()([channel_refined_feature, spatial_attention])
+
+# =====================================================
+# Hybrid CNN with Structural Attention + CBAM
+# =====================================================
+def blocks(input_shape, num_classes):
+    inputs = Input(shape=input_shape)
+
+    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D()(x)
+
+    sa_block = StructuralAttention(num_heads=2, embed_dim=32, mlp_dim=64)
+    x = sa_block(x)
+
+    x = cbam_block(x)
+
+    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D()(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation='softmax', name="output")(x)
+
+    return models.Model(inputs=inputs, outputs=outputs)
+
+# =====================================================
+# Training with AFOGD + Checkpoints + Metrics
+# =====================================================
+def proposed_model(x_train, x_test, y_train, y_test, train_percent, DB,
+                   base_epochs=[100, 200, 300, 400, 500], batch_size=8):
+    input_shape = x_train.shape[1:]
+    num_classes = len(np.unique(y_train))
+
+    y_train_cat = to_categorical(y_train, num_classes)
+    y_test_cat = to_categorical(y_test, num_classes)
+
+    model = blocks(input_shape, num_classes)
+
+    # -------- AFOGD Parameters --------
+    mu = 0.7
+    delta = 1e-6
+    alpha = 0.001
+    c1, c2 = 0.5, 1.5
+
+    prev_weights = [tf.identity(w) for w in model.trainable_variables]
+
+    # Dataset batching
+    train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train_cat))
+    train_dataset = train_dataset.shuffle(buffer_size=1024).batch(batch_size)
+    test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test_cat)).batch(batch_size)
+
+    # --- Paths ---
+    Checkpoint_dir = f"Checkpoint/{DB}/TP_{int(train_percent * 100)}"
+    os.makedirs(Checkpoint_dir, exist_ok=True)
+    metric_path = f"Analysis/Performance_Analysis/{DB}/"
+    os.makedirs(metric_path, exist_ok=True)
+    os.makedirs("Architectures/", exist_ok=True)
+    os.makedirs("Saved_model/", exist_ok=True)
+
+    prev_epoch = 0
+    metrics_all = {}
+
+    # --- Resume from checkpoint if available ---
+    for ep in reversed(base_epochs):
+        ckt_path = os.path.join(Checkpoint_dir, f"model_epoch_{ep}.weights.h5")
+        metrics_file = os.path.join(metric_path, f"metrics_{train_percent}percent_epoch{ep}.npy")
+        if os.path.exists(ckt_path) and os.path.exists(metrics_file):
+            print(f"Found checkpoint at epoch {ep}, resuming...")
+            model.load_weights(ckt_path)
+            prev_epoch = ep
+            break
+
+    # --- Training loop ---
+    for end_epochs in base_epochs:
+        if end_epochs <= prev_epoch:
+            continue
+
+        print(f"\nTraining from {prev_epoch+1} to {end_epochs} epochs...")
+
+        try:
+            for epoch in range(prev_epoch, end_epochs):
+                print(f"\nEpoch {epoch+1}/{end_epochs}")
+                for step, (x_batch, y_batch) in enumerate(train_dataset):
+                    with tf.GradientTape() as tape:
+                        preds = model(x_batch, training=True)
+                        loss_value = tf.reduce_mean(
+                            tf.keras.losses.categorical_crossentropy(y_batch, preds)
+                        )
+
+                    grads = tape.gradient(loss_value, model.trainable_variables)
+
+                    # --- AFOGD update ---
+                    new_prev_weights = []
+                    for w, g, pw in zip(model.trainable_variables, grads, prev_weights):
+                        diff = w - pw
+                        norm_sq = tf.reduce_sum(tf.square(diff))
+                        frac_term = tf.pow(norm_sq + delta, 1.0 - mu)
+                        beta_k = tf.clip_by_value(frac_term, c1, c2)
+
+                        w.assign_sub(alpha * g * beta_k)
+                        new_prev_weights.append(tf.identity(w))
+
+                    prev_weights = new_prev_weights
+
+                    if step % 50 == 0:
+                        print(f"Step {step}, Loss: {loss_value.numpy():.4f}")
+
+            # --- Save checkpoint, metrics, model ---
+            ckt_path = os.path.join(Checkpoint_dir, f"model_epoch_{end_epochs}.weights.h5")
+            metrics_file = os.path.join(metric_path, f"metrics_{train_percent}percent_epoch{end_epochs}.npy")
+
+            plot_model(model, to_file="Architectures/model_architecture.png",
+                       show_shapes=True, show_layer_names=True)
+            model.save_weights(ckt_path)
+            model.save(f"Saved_model/{DB}_model.h5")
+            model.save(f"Saved_model/{DB}_model.keras")
+            print(f"Checkpoint saved at: {ckt_path}")
+
+            preds = model.predict(x_test, verbose=0)
+            y_pred2 = np.argmax(preds, axis=1)
+            y_test_labels = np.argmax(y_test_cat, axis=1)
+            metrics = main_est_parameters(y_test_labels, y_pred2)
+
+            metrics_all[f"epoch_{end_epochs}"] = metrics
+            np.save(metrics_file, metrics)
+            print(f"Metrics saved at: {metrics_file}")
+
+            prev_epoch = end_epochs
+
+        except KeyboardInterrupt:
+            print(f"Training interrupted at {prev_epoch+1}-{end_epochs}, not saving.")
+            raise
+
+    print(f"\nCompleted training for {train_percent}% up to {prev_epoch} epochs.")
+    return metrics_all
